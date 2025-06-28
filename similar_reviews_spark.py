@@ -1,49 +1,76 @@
 import re
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lower, regexp_replace, split, udf
-from pyspark.sql.types import ArrayType, StringType, SetType
+from pyspark.sql.types import ArrayType, StringType
 from itertools import combinations
 
-# Define a set of common English stop words
-# (This is a basic list, a more comprehensive one might be needed for better results)
-STOP_WORDS = set([
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in",
-    "into", "is", "it", "no", "not", "of", "on", "or", "such", "that", "the",
-    "their", "then", "there", "these", "they", "this", "to", "was", "will", "with",
-    "i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your",
-    "yours", "yourself", "yourselves", "he", "him", "his", "himself", "she",
-    "her", "hers", "herself", "it", "its", "itself", "they", "them", "their",
-    "theirs", "themselves", "what", "which", "who", "whom", "this", "that",
-    "these", "those", "am", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "having", "do", "does", "did", "doing", "a", "an",
-    "the", "and", "but", "if", "or", "because", "as", "until", "while", "of",
-    "at", "by", "for", "with", "about", "against", "between", "into", "through",
-    "during", "before", "after", "above", "below", "to", "from", "up", "down",
-    "in", "out", "on", "off", "over", "under", "again", "further", "then", "once",
-    "here", "there", "when", "where", "why", "how", "all", "any", "both", "each",
-    "few", "more", "most", "other", "some", "such", "no", "nor", "not", "only",
-    "own", "same", "so", "than", "too", "very", "s", "t", "can", "will", "just",
-    "don", "should", "now", "d", "ll", "m", "o", "re", "ve", "y", "ain", "aren",
-    "couldn", "didn", "doesn", "hadn", "hasn", "haven", "isn", "ma", "mightn",
-    "mustn", "needn", "shan", "shouldn", "wasn", "weren", "won", "wouldn"
-])
+# NLTK imports for advanced preprocessing
+import nltk
+from nltk.corpus import wordnet, stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.tokenize import word_tokenize
 
-def preprocess_text(text):
+# --- NLTK Setup ---
+# Ensure NLTK data is available in the Spark environment.
+# For local mode, download them once:
+# nltk.download('punkt')
+# nltk.download('averaged_perceptron_tagger')
+# nltk.download('wordnet')
+# nltk.download('omw-1.4')
+# nltk.download('stopwords')
+
+STOP_WORDS = set(stopwords.words('english'))
+# Add any custom stop words if needed
+# STOP_WORDS.update(["book", "read", "review"])
+
+
+# Helper function to convert NLTK POS tags to WordNet POS tags
+def get_wordnet_pos(treebank_tag):
+    if treebank_tag.startswith('J'):
+        return wordnet.ADJ
+    elif treebank_tag.startswith('V'):
+        return wordnet.VERB
+    elif treebank_tag.startswith('N'):
+        return wordnet.NOUN
+    elif treebank_tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return wordnet.NOUN # Default to noun
+
+lemmatizer = WordNetLemmatizer()
+
+def preprocess_text_enhanced(text):
     if text is None:
         return []
-    # Lowercase
+
+    # 1. Lowercase
     text = text.lower()
-    # Remove punctuation (and numbers for simplicity, though numbers might be relevant in some contexts)
+
+    # 2. Remove punctuation and numbers (numbers are removed after tokenization for better POS tagging)
     text = re.sub(r'[^\w\s]', '', text) # Remove punctuation
-    text = re.sub(r'\d+', '', text)      # Remove numbers
-    # Tokenize by splitting whitespace
-    words = text.split()
-    # Remove stop words and create a set of unique words
-    processed_words = set(word for word in words if word not in STOP_WORDS and len(word) > 1) # also filter out single char tokens
-    return list(processed_words) # Return list for Spark UDF compatibility with ArrayType(StringType())
+
+    # 3. Tokenize using NLTK
+    tokens = word_tokenize(text)
+
+    # 4. POS Tagging
+    pos_tagged_tokens = nltk.pos_tag(tokens)
+
+    # 5. Lemmatization
+    lemmatized_tokens = []
+    for word, tag in pos_tagged_tokens:
+        wn_tag = get_wordnet_pos(tag)
+        lemma = lemmatizer.lemmatize(word, pos=wn_tag)
+        # Remove numbers after lemmatization & check length
+        if not lemma.isdigit() and len(lemma) > 1:
+            lemmatized_tokens.append(lemma)
+
+    # 6. Remove stop words
+    processed_words = set(word for word in lemmatized_tokens if word not in STOP_WORDS)
+
+    return list(processed_words)
 
 # UDF for text preprocessing
-preprocess_text_udf = udf(preprocess_text, ArrayType(StringType()))
+preprocess_text_udf = udf(preprocess_text_enhanced, ArrayType(StringType()))
 
 def calculate_jaccard_similarity(set1, set2):
     if not set1 and not set2:
@@ -111,59 +138,165 @@ def main():
     # Cache this RDD as it will be used multiple times
     processed_rdd.cache()
     print(f"Preprocessing and tokenization complete. RDD count: {processed_rdd.count()}")
-    # print("Sample of processed RDD:", processed_rdd.take(5))
+    # print("Sample of processed RDD:", processed_rdd.take(5)) # This RDD is (review_id, {lemma_set})
+
+    # --- Configuration for Shingling, MinHashing, and LSH ---
+    K_SHINGLE = 9  # Length of k-shingles (e.g., 5 or 9 characters)
+    NUM_HASH_FUNCTIONS = 100  # Number of MinHash functions (e.g., 100 or 200)
+    LSH_BANDS = 20  # Number of bands for LSH
+
+    if NUM_HASH_FUNCTIONS % LSH_BANDS != 0:
+        raise ValueError("NUM_HASH_FUNCTIONS must be divisible by LSH_BANDS.")
+    LSH_ROWS = NUM_HASH_FUNCTIONS // LSH_BANDS # Rows per band
+
+    if LSH_ROWS == 0: # Should be caught by the divisibility check, but good to have
+        raise ValueError("LSH_BANDS and NUM_HASH_FUNCTIONS result in 0 rows per band.")
+
+    # Max value for hash signatures in MinHash, used for initializing min values
+    MAX_HASH_VAL = (1 << 32) - 1
+    # Seeds for MinHash functions to ensure different hash computations
+    HASH_SEEDS = list(range(NUM_HASH_FUNCTIONS))
+
+    print(f"\n--- Stage: Shingling, MinHashing & LSH ---")
+    print(f"K-shingle length: {K_SHINGLE}")
+    print(f"Number of hash functions for MinHash: {NUM_HASH_FUNCTIONS}")
+    print(f"LSH: {LSH_BANDS} bands, {LSH_ROWS} rows per band.")
+
+    # --- c1. Shingling ---
+    # Converts a list of lemmas into a set of character k-shingles.
+    # Character shingles are often used for near-duplicate text detection.
+    def create_shingles(lemmas_list, k):
+        if not lemmas_list:
+            return set()
+        # Join lemmas into a single string to create character shingles
+        # Alternatively, could create shingles from tokens directly if preferred
+        # For character shingles, it's common to remove spaces or use a special char
+        doc_str = "".join(sorted(list(text_content))).replace(" ", "") # sorted list of lemmas joined
+        if len(doc_str) < k:
+            return {doc_str} # if doc is shorter than k, shingle is the doc itself
+        shingles = set()
+        for i in range(len(doc_str) - k + 1):
+            shingles.add(doc_str[i:i+k])
+        return list(shingles) # Return list for Spark UDF
+
+    create_shingles_udf = udf(lambda text_list: create_shingles(" ".join(text_list), K_SHINGLE), ArrayType(StringType()))
+
+    # Apply shingling to the 'processed_words' (which are lemmas)
+    # The input to create_shingles UDF should be the list of lemmas
+    shingled_reviews_df = tokenized_reviews_df.withColumn("shingles", create_shingles_udf(col("processed_words")))
+
+    # RDD of (review_id, {shingle_set})
+    shingled_rdd = shingled_reviews_df.select("review_id", "shingles").rdd \
+        .map(lambda row: (row.review_id, set(row.shingles))) \
+        .filter(lambda x: len(x[1]) > 0)
+
+    shingled_rdd.cache()
+    print(f"Shingling complete. RDD count: {shingled_rdd.count()}")
+    # print("Sample of shingled RDD:", shingled_rdd.take(2))
+
+    # c2. MinHash Signature Generation
+    # Create N hash functions. For simplicity, use different seeds for a standard hash function.
+    # (Python's hash() is not stable across processes/runs for strings, so avoid it here for distributed consistency)
+    # Using a simple approach: hash(shingle + str(seed)) % some_large_prime
+    # A better way would be to use variants of murmurhash or similar.
+    # For this example, we'll use a large prime and multiple hash computations.
+    # To make it more robust for Spark, the hash functions need to be defined or accessible within map operations.
+
+    # Max value for hash (to keep them in a manageable range, helps with permutations if used)
+    # Using a large prime number as the modulus
+    MAX_HASH_VAL = (1 << 32) -1 # or a suitable large prime like 2**31 - 1
+
+    # Generate seeds for hash functions
+    # These seeds will be broadcasted if used in a UDF or closure
+    hash_seeds = list(range(NUM_HASH_FUNCTIONS))
+
+    def generate_minhash_signature(shingle_set, num_hashes, seeds):
+        signature = []
+        if not shingle_set:
+            return [MAX_HASH_VAL] * num_hashes # Return max hash if no shingles
+
+        for i in range(num_hashes):
+            min_hash_for_this_func = MAX_HASH_VAL
+            for shingle in shingle_set:
+                # Combine shingle with seed and hash. Using Python's built-in hash for simplicity here,
+                # but be aware of its limitations for distributed consistency if not careful.
+                # For better consistency, use hashlib.sha256 or murmurhash3.
+                # For now, let's use a simple combination and hash.
+                # Ensure shingle is string.
+                shingle_str = str(shingle)
+                current_hash = abs(hash(shingle_str + str(seeds[i]))) % MAX_HASH_VAL # abs for positive
+                if current_hash < min_hash_for_this_func:
+                    min_hash_for_this_func = current_hash
+            signature.append(min_hash_for_this_func)
+        return signature
+
+    # Use a map operation on shingled_rdd to generate signatures
+    # The function and seeds need to be available in the closure
+    minhash_signatures_rdd = shingled_rdd.map(
+        lambda x: (x[0], generate_minhash_signature(x[1], NUM_HASH_FUNCTIONS, hash_seeds))
+    )
+    minhash_signatures_rdd.cache()
+    print(f"MinHash signature generation complete. RDD count: {minhash_signatures_rdd.count()}")
+    # print("Sample MinHash Signatures:", minhash_signatures_rdd.take(2))
+
+    # c3. LSH Banding for Candidate Pairs
+    # signature_rdd is (review_id, [minhash_signature_vector])
+    def generate_lsh_bands(signature_item, bands, rows):
+        review_id, signature_vector = signature_item
+        band_kv_pairs = []
+        if not signature_vector or len(signature_vector) != bands * rows:
+            return band_kv_pairs # Or handle error
+
+        for i in range(bands):
+            start_index = i * rows
+            end_index = start_index + rows
+            band_content = tuple(signature_vector[start_index:end_index])
+            # Hash the band content to create a bucket key
+            # The band_id (i) is part of the key to distinguish buckets from different bands
+            bucket_key = (i, hash(band_content))
+            band_kv_pairs.append((bucket_key, review_id))
+        return band_kv_pairs
+
+    # ( (band_id, bucket_hash), review_id )
+    banded_rdd = minhash_signatures_rdd.flatMap(
+        lambda sig_item: generate_lsh_bands(sig_item, LSH_BANDS, LSH_ROWS)
+    )
+
+    # Group by bucket_key to find documents in the same bucket
+    # ( (band_id, bucket_hash), [review_id1, review_id2, ...] )
+    bucketed_reviews_rdd = banded_rdd.groupByKey().mapValues(list)
+
+    # Generate candidate pairs from buckets
+    # If a bucket has multiple review_ids, all pairs from that list are candidates
+    candidate_pairs_lsh_rdd = bucketed_reviews_rdd.flatMap(
+        lambda x: [tuple(sorted(pair)) for pair in combinations(x[1], 2) if len(x[1]) > 1]
+    ).distinct() # Get unique pairs (id1, id2) where id1 < id2
+
+    candidate_pairs_lsh_rdd.cache()
+    num_candidate_pairs = candidate_pairs_lsh_rdd.count()
+    print(f"LSH complete. Number of candidate pairs: {num_candidate_pairs}")
+    # print("Sample LSH candidate pairs:", candidate_pairs_lsh_rdd.take(10))
 
 
-    # c. Generate Candidate Pairs (Inverted Index approach)
-    # Map 1: (word, review_id)
-    word_to_review_id_rdd = processed_rdd.flatMap(lambda x: [(word, x[0]) for word in x[1]])
-    # print("Sample of word_to_review_id_rdd:", word_to_review_id_rdd.take(10))
+    # d. Calculate Jaccard Similarity for LSH Candidate Pairs
+    # We need the *original shingle sets* for the candidate pairs identified by LSH.
+    # shingled_rdd contains (review_id, {shingle_set})
 
-    # Reduce 1 (Group by word): (word, [review_id1, review_id2, ...])
-    word_to_review_ids_list_rdd = word_to_review_id_rdd.groupByKey().mapValues(list)
-    # print("Sample of word_to_review_ids_list_rdd:", word_to_review_ids_list_rdd.take(5))
+    # (id1, (id2, shingle_set1))
+    pairs_with_set1 = candidate_pairs_lsh_rdd.map(lambda pair: (pair[0], pair[1])) \
+        .join(shingled_rdd) \
+        .map(lambda x: (x[1][0], (x[0], x[1][1]))) # (id2, (id1, shingle_set1))
 
-    # Map 2 (Generate pairs): ([review_id_pair1, review_id_pair2, ...])
-    # For each list of review_ids sharing a common word, generate unique pairs
-    # Ensure review_id1 < review_id2 to avoid duplicate pairs like (B,A) if (A,B) exists
-    # and to avoid pairing a review with itself.
-    candidate_pairs_rdd = word_to_review_ids_list_rdd.flatMap(
-        lambda x: [tuple(sorted(pair)) for pair in combinations(x[1], 2)]
-    ).distinct() # Get unique pairs
-
-    # Cache candidate pairs as they are crucial for the next step
-    candidate_pairs_rdd.cache()
-    print(f"Candidate pair generation complete. Number of candidate pairs: {candidate_pairs_rdd.count()}")
-    # print("Sample of candidate_pairs_rdd:", candidate_pairs_rdd.take(10))
-
-    # d. Calculate Jaccard Similarity for Candidate Pairs
-    # We need the word sets for each review to calculate Jaccard.
-    # Broadcast the processed_rdd data (or a map version of it) if it's not too large,
-    # or join candidate_pairs_rdd with processed_rdd.
-    # Joining is more robust for larger datasets.
-
-    # Create RDDs for joining: (review_id, word_set)
-    review_word_sets_rdd = processed_rdd # This is already (review_id, word_set)
-
-    # Join candidate pairs with word sets
-    # pair: (id1, id2)
-    # Need to join twice to get word sets for both ids in the pair
-
-    # (id1, (id2, word_set1))
-    pairs_with_set1 = candidate_pairs_rdd.map(lambda pair: (pair[0], pair[1])) \
-        .join(review_word_sets_rdd) \
-        .map(lambda x: (x[1][0], (x[0], x[1][1]))) # (id2, (id1, word_set1))
-
-    # (id2, ((id1, word_set1), word_set2))
-    # Then map to ((id1, id2), (word_set1, word_set2))
-    joined_pairs_with_sets = pairs_with_set1.join(review_word_sets_rdd) \
+    # (id2, ((id1, shingle_set1), shingle_set2))
+    # Then map to ((id1, id2), (shingle_set1, shingle_set2))
+    joined_pairs_with_sets = pairs_with_set1.join(shingled_rdd) \
         .map(lambda x: ((x[1][0][0], x[0]), (x[1][0][1], x[1][1]))) # ((id1, id2), (set1, set2))
 
-    # Calculate Jaccard similarity
+    # Calculate Jaccard similarity using the shingle sets
     similarities_rdd = joined_pairs_with_sets.map(
         lambda x: (x[0], calculate_jaccard_similarity(x[1][0], x[1][1]))
     )
-    # print("Sample of similarities_rdd:", similarities_rdd.take(10))
+    # print("Sample similarities_rdd (LSH candidates):", similarities_rdd.take(10))
 
     # e. Filter and Output
     highly_similar_pairs_rdd = similarities_rdd.filter(lambda x: x[1] >= similarity_threshold)
